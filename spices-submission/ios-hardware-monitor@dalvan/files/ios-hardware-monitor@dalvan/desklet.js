@@ -26,6 +26,8 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
         this.instance_id = desklet_id;
         this._updateTimerId = 0;
         this._gpuQueryInProgress = false;
+        this._btQueryInProgress = false;
+        this._cachedBtDevices = [];
 
         // Default settings fallback
         this.themeMode = "dark";
@@ -644,10 +646,32 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
             } catch (e) {}
         }
 
-        // 2. Query BlueZ ObjectManager via D-Bus for Bluetooth devices & org.bluez.Battery1
+        // 2. Query BlueZ ObjectManager asynchronously via D-Bus for Bluetooth devices & org.bluez.Battery1
+        this._queryBluezAsync();
+
+        for (let bt of this._cachedBtDevices) {
+            if (bt.address && seenMacs.has(bt.address)) continue;
+            if (!bt.connected && (!this.showDisconnectedBt || !bt.paired)) continue;
+            list.push({
+                id: bt.id,
+                name: bt.name,
+                fullName: bt.fullName,
+                percentage: bt.hasBatteryLevel ? bt.percentage : (bt.connected ? 100 : 0),
+                hasBatteryLevel: bt.hasBatteryLevel,
+                charging: false,
+                connected: bt.connected,
+                type: bt.type
+            });
+        }
+
+        this.metrics.batteries = list;
+    }
+
+    _queryBluezAsync() {
+        if (this._btQueryInProgress) return;
+        this._btQueryInProgress = true;
         try {
-            let bus = Gio.DBus.system;
-            let res = bus.call_sync(
+            Gio.DBus.system.call(
                 "org.bluez",
                 "/",
                 "org.freedesktop.DBus.ObjectManager",
@@ -656,42 +680,46 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
                 new GLib.VariantType("(a{oa{sa{sv}}})"),
                 Gio.DBusCallFlags.NONE,
                 1500,
-                null
+                null,
+                (bus, res) => {
+                    this._btQueryInProgress = false;
+                    try {
+                        let reply = bus.call_finish(res);
+                        let [objects] = reply.deep_unpack();
+                        let btList = [];
+                        for (let path in objects) {
+                            let ifaces = objects[path];
+                            let dev = ifaces["org.bluez.Device1"];
+                            if (!dev) continue;
+
+                            let address = dev.Address ? dev.Address.deep_unpack().toUpperCase() : "";
+                            let connected = dev.Connected ? dev.Connected.deep_unpack() : false;
+                            let paired = dev.Paired ? dev.Paired.deep_unpack() : false;
+                            let alias = dev.Alias ? dev.Alias.deep_unpack() : (dev.Name ? dev.Name.deep_unpack() : "Bluetooth");
+                            let iconName = dev.Icon ? dev.Icon.deep_unpack() : "";
+                            let batIface = ifaces["org.bluez.Battery1"];
+                            let pct = batIface && batIface.Percentage ? batIface.Percentage.deep_unpack() : null;
+                            let devType = this._classifyBluezIcon(iconName, alias);
+
+                            btList.push({
+                                id: path,
+                                address: address,
+                                name: this._shortenDeviceName(alias),
+                                fullName: alias,
+                                percentage: pct !== null ? Math.max(0, Math.min(100, pct)) : 0,
+                                hasBatteryLevel: pct !== null,
+                                connected: connected,
+                                paired: paired,
+                                type: devType
+                            });
+                        }
+                        this._cachedBtDevices = btList;
+                    } catch (e) {}
+                }
             );
-            let [objects] = res.deep_unpack();
-            for (let path in objects) {
-                let ifaces = objects[path];
-                let dev = ifaces["org.bluez.Device1"];
-                if (!dev) continue;
-
-                let address = dev.Address ? dev.Address.deep_unpack().toUpperCase() : "";
-                if (address && seenMacs.has(address)) continue;
-
-                let connected = dev.Connected ? dev.Connected.deep_unpack() : false;
-                let paired = dev.Paired ? dev.Paired.deep_unpack() : false;
-                if (!connected && (!this.showDisconnectedBt || !paired)) continue;
-
-                let alias = dev.Alias ? dev.Alias.deep_unpack() : (dev.Name ? dev.Name.deep_unpack() : "Bluetooth");
-                let iconName = dev.Icon ? dev.Icon.deep_unpack() : "";
-                let batIface = ifaces["org.bluez.Battery1"];
-                let pct = batIface && batIface.Percentage ? batIface.Percentage.deep_unpack() : null;
-
-                let devType = this._classifyBluezIcon(iconName, alias);
-
-                list.push({
-                    id: path,
-                    name: this._shortenDeviceName(alias),
-                    fullName: alias,
-                    percentage: pct !== null ? Math.max(0, Math.min(100, pct)) : (connected ? 100 : 0),
-                    hasBatteryLevel: pct !== null,
-                    charging: false,
-                    connected: connected,
-                    type: devType
-                });
-            }
-        } catch (e) {}
-
-        this.metrics.batteries = list;
+        } catch (e) {
+            this._btQueryInProgress = false;
+        }
     }
 
     _classifyUPowerDevice(kind, model, nativePath) {
