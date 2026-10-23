@@ -3,7 +3,6 @@ const St = imports.gi.St;
 const GLib = imports.gi.GLib;
 const Gio = imports.gi.Gio;
 const Mainloop = imports.mainloop;
-const Lang = imports.lang;
 const Settings = imports.ui.settings;
 const PopupMenu = imports.ui.popupMenu;
 const Util = imports.misc.util;
@@ -27,7 +26,12 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
         this._updateTimerId = 0;
         this._gpuQueryInProgress = false;
         this._btQueryInProgress = false;
+        this._hwmonDiscoveryInProgress = false;
         this._cachedBtDevices = [];
+        this._sysInfoCache = {
+            productName: null,
+            osPrettyName: null
+        };
 
         // Default settings fallback
         this.themeMode = "dark";
@@ -59,7 +63,7 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
         this._prevNetTime = 0;
 
         this.metrics = {
-            hostname: this._detectSystemTitle(),
+            hostname: GLib.get_host_name() || "Linux",
             uptimeStr: "",
             cpu: { usage: 0, temp: null, cores: 1 },
             ram: { usage: 0, usedGb: 0, totalGb: 0, swapUsedGb: 0, swapTotalGb: 0 },
@@ -84,7 +88,8 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
         this._initSettings();
         this._initContextMenu();
         this._buildUI();
-        this._discoverHwmon();
+        this._loadSystemIdentityAsync();
+        this._discoverHwmonAsync();
         this._refreshAll();
         this._startLoop();
     }
@@ -92,7 +97,7 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
     _initSettings() {
         this.settings = new Settings.DeskletSettings(this, this.metadata["uuid"], this.instance_id);
         const bind = (key, prop) => {
-            this.settings.bind(key, prop, Lang.bind(this, this._onSettingsChanged));
+            this.settings.bind(key, prop, () => this._onSettingsChanged());
         };
 
         bind("theme-mode", "themeMode");
@@ -120,20 +125,26 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
     _initContextMenu() {
         let refreshItem = new PopupMenu.PopupMenuItem("Atualizar Agora");
         refreshItem.connect("activate", () => {
-            this._discoverHwmon();
+            this._discoverHwmonAsync();
             this._refreshAll();
         });
         this._menu.addMenuItem(refreshItem);
 
         let btItem = new PopupMenu.PopupMenuItem("Configurações de Bluetooth");
         btItem.connect("activate", () => {
-            Util.spawnCommandLine("blueberry || cinnamon-settings bluetooth || blueman-manager");
+            if (GLib.find_program_in_path("blueberry")) {
+                Util.spawn(["blueberry"]);
+            } else if (GLib.find_program_in_path("blueman-manager")) {
+                Util.spawn(["blueman-manager"]);
+            } else {
+                Util.spawn(["cinnamon-settings", "bluetooth"]);
+            }
         });
         this._menu.addMenuItem(btItem);
 
         let sysmonItem = new PopupMenu.PopupMenuItem("Abrir Monitor do Sistema");
         sysmonItem.connect("activate", () => {
-            Util.spawnCommandLine("gnome-system-monitor");
+            Util.spawn(["gnome-system-monitor"]);
         });
         this._menu.addMenuItem(sysmonItem);
     }
@@ -147,7 +158,7 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
         });
 
         this.canvas = new St.DrawingArea({ reactive: false });
-        this.canvas.connect("repaint", Lang.bind(this, this._onRepaint));
+        this.canvas.connect("repaint", (area) => this._onRepaint(area));
 
         this.rootBox.add_actor(this.canvas);
         this.setContent(this.rootBox);
@@ -166,10 +177,10 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
             this._updateTimerId = 0;
         }
         let intervalMs = Math.max(1000, Math.round((this.updateInterval || 2.0) * 1000));
-        this._updateTimerId = Mainloop.timeout_add(intervalMs, Lang.bind(this, () => {
+        this._updateTimerId = Mainloop.timeout_add(intervalMs, () => {
             this._refreshAll();
             return GLib.SOURCE_CONTINUE;
-        }));
+        });
     }
 
     on_desklet_removed() {
@@ -186,17 +197,83 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
     }
 
     // =========================================================================
-    // HARDWARE & BLUETOOTH TELEMETRY
+    // NON-BLOCKING ASYNC I/O HELPERS
     // =========================================================================
 
-    _readFileString(path) {
-        try {
-            let [ok, bytes] = GLib.file_get_contents(path);
-            if (ok && bytes) {
-                return imports.byteArray.toString(bytes).trim();
+    _readFileAsync(path, callback) {
+        let file = Gio.File.new_for_path(path);
+        file.load_contents_async(null, (f, res) => {
+            try {
+                let [ok, bytes] = f.load_contents_finish(res);
+                if (ok && bytes) {
+                    callback(imports.byteArray.toString(bytes).trim());
+                    return;
+                }
+            } catch (e) {}
+            callback(null);
+        });
+    }
+
+    _listDirAsync(path, callback) {
+        let dir = Gio.File.new_for_path(path);
+        dir.enumerate_children_async(
+            "standard::name",
+            Gio.FileQueryInfoFlags.NONE,
+            GLib.PRIORITY_DEFAULT,
+            null,
+            (d, res) => {
+                let names = [];
+                try {
+                    let enumerator = d.enumerate_children_finish(res);
+                    let collectNext = () => {
+                        enumerator.next_files_async(64, GLib.PRIORITY_DEFAULT, null, (en, nextRes) => {
+                            try {
+                                let files = en.next_files_finish(nextRes);
+                                if (files && files.length > 0) {
+                                    for (let info of files) {
+                                        names.push(info.get_name());
+                                    }
+                                    collectNext();
+                                    return;
+                                }
+                            } catch (e) {}
+                            try {
+                                en.close_async(GLib.PRIORITY_DEFAULT, null, null);
+                            } catch (e) {}
+                            callback(names);
+                        });
+                    };
+                    collectNext();
+                } catch (e) {
+                    callback([]);
+                }
             }
-        } catch (e) {}
-        return null;
+        );
+    }
+
+    _loadSystemIdentityAsync() {
+        this._readFileAsync("/sys/devices/virtual/dmi/id/product_name", (prod) => {
+            if (prod && !prod.toLowerCase().includes("system product name") && !prod.toLowerCase().includes("to be filled") && !prod.toLowerCase().includes("default string")) {
+                let clean = prod.split("_")[0].replace(/FA\d+[A-Z]*/i, "").trim();
+                if (clean.length > 2) {
+                    this._sysInfoCache.productName = clean.length > 24 ? clean.substring(0, 24).trim() : clean;
+                    this.metrics.hostname = this._detectSystemTitle();
+                    if (this.canvas) this.canvas.queue_repaint();
+                }
+            }
+        });
+
+        this._readFileAsync("/etc/os-release", (osRelease) => {
+            if (osRelease) {
+                let m = osRelease.match(/^PRETTY_NAME=["']?([^"'\n]+)["']?/m) || osRelease.match(/^NAME=["']?([^"'\n]+)["']?/m);
+                if (m && m[1]) {
+                    let cleanOs = m[1].replace(/\s*\([^)]*\)/g, "").trim();
+                    this._sysInfoCache.osPrettyName = cleanOs.length > 24 ? cleanOs.substring(0, 24).trim() : cleanOs;
+                    this.metrics.hostname = this._detectSystemTitle();
+                    if (this.canvas) this.canvas.queue_repaint();
+                }
+            }
+        });
     }
 
     _detectSystemTitle() {
@@ -215,15 +292,8 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
             return user;
         }
 
-        if (mode === "distro") {
-            let osRelease = this._readFileString("/etc/os-release");
-            if (osRelease) {
-                let m = osRelease.match(/^PRETTY_NAME=["']?([^"'\n]+)["']?/m) || osRelease.match(/^NAME=["']?([^"'\n]+)["']?/m);
-                if (m && m[1]) {
-                    let cleanOs = m[1].replace(/\s*\([^)]*\)/g, "").trim();
-                    return cleanOs.length > 24 ? cleanOs.substring(0, 24).trim() : cleanOs;
-                }
-            }
+        if (mode === "distro" && this._sysInfoCache.osPrettyName) {
+            return this._sysInfoCache.osPrettyName;
         }
 
         if (mode === "hostname") {
@@ -231,21 +301,11 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
             return host.split(".")[0];
         }
 
-        // Default "model": Hardware DMI product_name -> fallback to Distro -> fallback to Hostname
-        let prod = this._readFileString("/sys/devices/virtual/dmi/id/product_name");
-        if (prod && !prod.toLowerCase().includes("system product name") && !prod.toLowerCase().includes("to be filled") && !prod.toLowerCase().includes("default string")) {
-            let clean = prod.split("_")[0].replace(/FA\d+[A-Z]*/i, "").trim();
-            if (clean.length > 2) {
-                return clean.length > 24 ? clean.substring(0, 24).trim() : clean;
-            }
+        if (this._sysInfoCache.productName) {
+            return this._sysInfoCache.productName;
         }
-
-        let osRelease = this._readFileString("/etc/os-release");
-        if (osRelease) {
-            let m = osRelease.match(/^PRETTY_NAME=["']?([^"'\n]+)["']?/m);
-            if (m && m[1]) {
-                return m[1].substring(0, 22).trim();
-            }
+        if (this._sysInfoCache.osPrettyName) {
+            return this._sysInfoCache.osPrettyName;
         }
 
         let host = GLib.get_host_name() || "Linux";
@@ -255,8 +315,15 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
         return host.split(".")[0];
     }
 
-    _discoverHwmon() {
-        this._hwmonCache = {
+    // =========================================================================
+    // ASYNC HARDWARE & BLUETOOTH TELEMETRY
+    // =========================================================================
+
+    _discoverHwmonAsync() {
+        if (this._hwmonDiscoveryInProgress) return;
+        this._hwmonDiscoveryInProgress = true;
+
+        let nextCache = {
             cpuTempPaths: [],
             gpuTempPaths: [],
             fanPaths: [],
@@ -266,73 +333,96 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
             hasNvidiaSmi: GLib.find_program_in_path("nvidia-smi") !== null
         };
 
-        try {
-            let baseDir = Gio.File.new_for_path("/sys/class/hwmon");
-            let enumerator = baseDir.enumerate_children("standard::name", Gio.FileQueryInfoFlags.NONE, null);
-            let info;
-            while ((info = enumerator.next_file(null)) !== null) {
-                let hwDir = "/sys/class/hwmon/" + info.get_name();
-                let chipName = (this._readFileString(hwDir + "/name") || "").toLowerCase();
-
-                let dirFile = Gio.File.new_for_path(hwDir);
-                let subEnum = dirFile.enumerate_children("standard::name", Gio.FileQueryInfoFlags.NONE, null);
-                let subInfo;
-                while ((subInfo = subEnum.next_file(null)) !== null) {
-                    let fname = subInfo.get_name();
-
-                    // Fan inputs
-                    if (/^fan\d+_input$/.test(fname)) {
-                        let prefix = fname.replace("_input", "");
-                        let label = this._readFileString(hwDir + "/" + prefix + "_label") || chipName || prefix;
-                        this._hwmonCache.fanPaths.push({
-                            input: hwDir + "/" + fname,
-                            label: label
-                        });
-                    }
-
-                    // Temp inputs
-                    if (/^temp\d+_input$/.test(fname)) {
-                        let prefix = fname.replace("_input", "");
-                        let label = (this._readFileString(hwDir + "/" + prefix + "_label") || "").toLowerCase();
-                        let fullPath = hwDir + "/" + fname;
-
-                        if (chipName.includes("coretemp") || chipName.includes("k10temp") || chipName.includes("zenpower") || chipName.includes("cpu") || chipName.includes("acpitz")) {
-                            let priority = (chipName.includes("coretemp") || chipName.includes("k10temp") || chipName.includes("zenpower")) ? 1 : 2;
-                            if (label.includes("tctl") || label.includes("tdie") || label.includes("package")) {
-                                priority = 0;
-                            }
-                            this._hwmonCache.cpuTempPaths.push({ path: fullPath, priority: priority });
-                        } else if (chipName.includes("amdgpu") || chipName.includes("radeon") || chipName.includes("nouveau") || chipName.includes("i915") || chipName.includes("xe")) {
-                            this._hwmonCache.gpuTempPaths.push(fullPath);
+        // Check DRM cards asynchronously without GLib.file_test
+        for (let i = 0; i < 4; i++) {
+            let cardDev = "/sys/class/drm/card" + i + "/device";
+            this._readFileAsync(cardDev + "/gpu_busy_percent", (val) => {
+                if (val !== null && !nextCache.drmGpuBusyPath) {
+                    nextCache.drmGpuBusyPath = cardDev + "/gpu_busy_percent";
+                    this._readFileAsync(cardDev + "/mem_info_vram_used", (vramVal) => {
+                        if (vramVal !== null) {
+                            nextCache.drmVramUsedPath = cardDev + "/mem_info_vram_used";
+                            nextCache.drmVramTotalPath = cardDev + "/mem_info_vram_total";
                         }
-                    }
+                    });
                 }
-                subEnum.close(null);
+            });
+        }
+
+        this._listDirAsync("/sys/class/hwmon", (hwDirs) => {
+            if (!hwDirs || hwDirs.length === 0) {
+                this._hwmonCache = nextCache;
+                this._hwmonDiscoveryInProgress = false;
+                return;
             }
-            enumerator.close(null);
-        } catch (e) {}
 
-        this._hwmonCache.cpuTempPaths.sort((a, b) => a.priority - b.priority);
-
-        // Check DRM cards for AMD / Intel sysfs GPU metrics
-        try {
-            for (let i = 0; i < 4; i++) {
-                let cardDev = "/sys/class/drm/card" + i + "/device";
-                if (GLib.file_test(cardDev + "/gpu_busy_percent", GLib.FileTest.EXISTS)) {
-                    this._hwmonCache.drmGpuBusyPath = cardDev + "/gpu_busy_percent";
-                    if (GLib.file_test(cardDev + "/mem_info_vram_used", GLib.FileTest.EXISTS)) {
-                        this._hwmonCache.drmVramUsedPath = cardDev + "/mem_info_vram_used";
-                        this._hwmonCache.drmVramTotalPath = cardDev + "/mem_info_vram_total";
-                    }
-                    break;
+            let pendingDirs = hwDirs.length;
+            const onDirDone = () => {
+                pendingDirs--;
+                if (pendingDirs <= 0) {
+                    nextCache.cpuTempPaths.sort((a, b) => a.priority - b.priority);
+                    this._hwmonCache = nextCache;
+                    this._hwmonDiscoveryInProgress = false;
+                    this._refreshAll();
                 }
+            };
+
+            for (let dName of hwDirs) {
+                let hwDir = "/sys/class/hwmon/" + dName;
+                this._readFileAsync(hwDir + "/name", (chipRaw) => {
+                    let chipName = (chipRaw || "").toLowerCase();
+                    this._listDirAsync(hwDir, (files) => {
+                        if (!files || files.length === 0) {
+                            onDirDone();
+                            return;
+                        }
+
+                        let pendingFiles = 0;
+                        for (let fname of files) {
+                            if (/^fan\d+_input$/.test(fname)) {
+                                pendingFiles++;
+                                let prefix = fname.replace("_input", "");
+                                this._readFileAsync(hwDir + "/" + prefix + "_label", (labelRaw) => {
+                                    nextCache.fanPaths.push({
+                                        input: hwDir + "/" + fname,
+                                        label: labelRaw || chipName || prefix
+                                    });
+                                    pendingFiles--;
+                                    if (pendingFiles === 0) onDirDone();
+                                });
+                            } else if (/^temp\d+_input$/.test(fname)) {
+                                pendingFiles++;
+                                let prefix = fname.replace("_input", "");
+                                let fullPath = hwDir + "/" + fname;
+                                this._readFileAsync(hwDir + "/" + prefix + "_label", (labelRaw) => {
+                                    let label = (labelRaw || "").toLowerCase();
+                                    if (chipName.includes("coretemp") || chipName.includes("k10temp") || chipName.includes("zenpower") || chipName.includes("cpu") || chipName.includes("acpitz")) {
+                                        let priority = (chipName.includes("coretemp") || chipName.includes("k10temp") || chipName.includes("zenpower")) ? 1 : 2;
+                                        if (label.includes("tctl") || label.includes("tdie") || label.includes("package")) {
+                                            priority = 0;
+                                        }
+                                        nextCache.cpuTempPaths.push({ path: fullPath, priority: priority });
+                                    } else if (chipName.includes("amdgpu") || chipName.includes("radeon") || chipName.includes("nouveau") || chipName.includes("i915") || chipName.includes("xe")) {
+                                        nextCache.gpuTempPaths.push(fullPath);
+                                    }
+                                    pendingFiles--;
+                                    if (pendingFiles === 0) onDirDone();
+                                });
+                            }
+                        }
+
+                        if (pendingFiles === 0) {
+                            onDirDone();
+                        }
+                    });
+                });
             }
-        } catch (e) {}
+        });
     }
 
     _refreshAll() {
-        if (!this._hwmonCache) {
-            this._discoverHwmon();
+        if (!this._hwmonCache && !this._hwmonDiscoveryInProgress) {
+            this._discoverHwmonAsync();
         }
 
         this.metrics.hostname = this._detectSystemTitle();
@@ -346,31 +436,32 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
         if (this.showGpu) this._updateGpu();
 
         this._updateCanvasSize();
-        this.canvas.queue_repaint();
+        if (this.canvas) this.canvas.queue_repaint();
     }
 
     _updateUptime() {
-        let content = this._readFileString("/proc/uptime");
-        if (!content) return;
-        let secs = parseFloat(content.split(/\s+/)[0]);
-        if (isNaN(secs)) return;
-        let days = Math.floor(secs / 86400);
-        let hours = Math.floor((secs % 86400) / 3600);
-        let mins = Math.floor((secs % 3600) / 60);
-        if (days > 0) {
-            this.metrics.uptimeStr = days + "d " + hours + "h";
-        } else if (hours > 0) {
-            this.metrics.uptimeStr = hours + "h " + mins + "m";
-        } else {
-            this.metrics.uptimeStr = mins + " min";
-        }
+        this._readFileAsync("/proc/uptime", (content) => {
+            if (!content) return;
+            let secs = parseFloat(content.split(/\s+/)[0]);
+            if (isNaN(secs)) return;
+            let days = Math.floor(secs / 86400);
+            let hours = Math.floor((secs % 86400) / 3600);
+            let mins = Math.floor((secs % 3600) / 60);
+            if (days > 0) {
+                this.metrics.uptimeStr = days + "d " + hours + "h";
+            } else if (hours > 0) {
+                this.metrics.uptimeStr = hours + "h " + mins + "m";
+            } else {
+                this.metrics.uptimeStr = mins + " min";
+            }
+            if (this.canvas) this.canvas.queue_repaint();
+        });
     }
 
     _updateCpu() {
-        let stat = this._readFileString("/proc/stat");
-        if (stat) {
-            let lines = stat.split("\n");
-            let cpuLine = lines[0];
+        this._readFileAsync("/proc/stat", (stat) => {
+            if (!stat) return;
+            let cpuLine = stat.split("\n")[0];
             if (cpuLine && cpuLine.startsWith("cpu ")) {
                 let parts = cpuLine.trim().split(/\s+/).slice(1).map(x => parseInt(x, 10) || 0);
                 let idle = parts[3] + (parts[4] || 0);
@@ -383,104 +474,141 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
                 }
                 this._prevCpuTotal = total;
                 this._prevCpuIdle = idle;
+                if (this.canvas) this.canvas.queue_repaint();
             }
-        }
+        });
 
-        let tempC = null;
-        for (let item of this._hwmonCache.cpuTempPaths) {
-            let raw = this._readFileString(item.path);
+        let tempPaths = (this._hwmonCache && this._hwmonCache.cpuTempPaths.length > 0)
+            ? this._hwmonCache.cpuTempPaths.map(x => x.path)
+            : ["/sys/class/thermal/thermal_zone0/temp"];
+
+        this._readFirstValidTempAsync(tempPaths, 0, (tempC) => {
+            if (tempC !== null) {
+                this.metrics.cpu.temp = tempC;
+                if (this.canvas) this.canvas.queue_repaint();
+            }
+        });
+    }
+
+    _readFirstValidTempAsync(paths, idx, callback) {
+        if (idx >= paths.length) {
+            callback(null);
+            return;
+        }
+        this._readFileAsync(paths[idx], (raw) => {
             if (raw !== null) {
                 let val = parseInt(raw, 10);
                 if (!isNaN(val) && val > 0 && val < 150000) {
-                    tempC = Math.round(val / 1000);
-                    break;
+                    callback(Math.round(val / 1000));
+                    return;
                 }
             }
-        }
-        if (tempC === null) {
-            let tz = this._readFileString("/sys/class/thermal/thermal_zone0/temp");
-            if (tz !== null) {
-                let val = parseInt(tz, 10);
-                if (!isNaN(val) && val > 0) tempC = Math.round(val / 1000);
-            }
-        }
-        this.metrics.cpu.temp = tempC;
+            this._readFirstValidTempAsync(paths, idx + 1, callback);
+        });
     }
 
     _updateRam() {
-        let meminfo = this._readFileString("/proc/meminfo");
-        if (!meminfo) return;
-        let map = {};
-        for (let line of meminfo.split("\n")) {
-            let m = line.match(/^(\w+):\s+(\d+)/);
-            if (m) map[m[1]] = parseInt(m[2], 10);
-        }
-        let totalKb = map["MemTotal"] || 1;
-        let availKb = map["MemAvailable"] !== undefined ? map["MemAvailable"] : ((map["MemFree"] || 0) + (map["Buffers"] || 0) + (map["Cached"] || 0));
-        let usedKb = Math.max(0, totalKb - availKb);
+        this._readFileAsync("/proc/meminfo", (meminfo) => {
+            if (!meminfo) return;
+            let map = {};
+            for (let line of meminfo.split("\n")) {
+                let m = line.match(/^(\w+):\s+(\d+)/);
+                if (m) map[m[1]] = parseInt(m[2], 10);
+            }
+            let totalKb = map["MemTotal"] || 1;
+            let availKb = map["MemAvailable"] !== undefined ? map["MemAvailable"] : ((map["MemFree"] || 0) + (map["Buffers"] || 0) + (map["Cached"] || 0));
+            let usedKb = Math.max(0, totalKb - availKb);
 
-        let swapTotalKb = map["SwapTotal"] || 0;
-        let swapFreeKb = map["SwapFree"] || 0;
-        let swapUsedKb = Math.max(0, swapTotalKb - swapFreeKb);
+            let swapTotalKb = map["SwapTotal"] || 0;
+            let swapFreeKb = map["SwapFree"] || 0;
+            let swapUsedKb = Math.max(0, swapTotalKb - swapFreeKb);
 
-        this.metrics.ram.usage = Math.round((usedKb / totalKb) * 100);
-        this.metrics.ram.usedGb = usedKb / (1024 * 1024);
-        this.metrics.ram.totalGb = totalKb / (1024 * 1024);
-        this.metrics.ram.swapUsedGb = swapUsedKb / (1024 * 1024);
-        this.metrics.ram.swapTotalGb = swapTotalKb / (1024 * 1024);
+            this.metrics.ram.usage = Math.round((usedKb / totalKb) * 100);
+            this.metrics.ram.usedGb = usedKb / (1024 * 1024);
+            this.metrics.ram.totalGb = totalKb / (1024 * 1024);
+            this.metrics.ram.swapUsedGb = swapUsedKb / (1024 * 1024);
+            this.metrics.ram.swapTotalGb = swapTotalKb / (1024 * 1024);
+            if (this.canvas) this.canvas.queue_repaint();
+        });
     }
 
     _updateFan() {
-        let fans = [];
-        let maxRpm = 0;
-        let primaryLabel = "Cooler";
-
-        for (let f of this._hwmonCache.fanPaths) {
-            let raw = this._readFileString(f.input);
-            if (raw !== null) {
-                let rpm = parseInt(raw, 10);
-                if (!isNaN(rpm) && rpm >= 0) {
-                    fans.push({ label: f.label, rpm: rpm });
-                    if (rpm > maxRpm) {
-                        maxRpm = rpm;
-                        primaryLabel = f.label;
-                    }
-                }
-            }
+        if (!this._hwmonCache || this._hwmonCache.fanPaths.length === 0) {
+            this.metrics.fan.available = false;
+            return;
         }
 
-        if (fans.length > 0) {
-            this.metrics.fan.available = true;
-            this.metrics.fan.rpm = maxRpm;
-            this.metrics.fan.count = fans.length;
-            this.metrics.fan.details = fans;
-            this.metrics.fan.label = primaryLabel.replace(/_/g, " ").toUpperCase();
-        } else {
-            this.metrics.fan.available = false;
-            this.metrics.fan.rpm = 0;
-            this.metrics.fan.details = [];
+        let fanPaths = this._hwmonCache.fanPaths;
+        let fans = [];
+        let pending = fanPaths.length;
+
+        for (let f of fanPaths) {
+            this._readFileAsync(f.input, (raw) => {
+                if (raw !== null) {
+                    let rpm = parseInt(raw, 10);
+                    if (!isNaN(rpm) && rpm >= 0) {
+                        fans.push({ label: f.label, rpm: rpm });
+                    }
+                }
+                pending--;
+                if (pending <= 0) {
+                    if (fans.length > 0) {
+                        let maxRpm = 0;
+                        let primaryLabel = "Cooler";
+                        for (let item of fans) {
+                            if (item.rpm > maxRpm) {
+                                maxRpm = item.rpm;
+                                primaryLabel = item.label;
+                            }
+                        }
+                        this.metrics.fan.available = true;
+                        this.metrics.fan.rpm = maxRpm;
+                        this.metrics.fan.count = fans.length;
+                        this.metrics.fan.details = fans;
+                        this.metrics.fan.label = primaryLabel.replace(/_/g, " ").toUpperCase();
+                    } else {
+                        this.metrics.fan.available = false;
+                        this.metrics.fan.rpm = 0;
+                        this.metrics.fan.details = [];
+                    }
+                    if (this.canvas) this.canvas.queue_repaint();
+                }
+            });
         }
     }
 
     _updateGpu() {
-        // 1. Try DRM sysfs first if available (AMD/Intel zero-overhead)
+        if (!this._hwmonCache) return;
+
+        // 1. Try DRM sysfs first if available (AMD/Intel non-blocking async)
         if (this._hwmonCache.drmGpuBusyPath) {
-            let busyRaw = this._readFileString(this._hwmonCache.drmGpuBusyPath);
-            if (busyRaw !== null) {
-                this.metrics.gpu.available = true;
-                this.metrics.gpu.usage = Math.max(0, Math.min(100, parseInt(busyRaw, 10) || 0));
-                if (this._hwmonCache.drmVramUsedPath && this._hwmonCache.drmVramTotalPath) {
-                    let u = parseInt(this._readFileString(this._hwmonCache.drmVramUsedPath) || "0", 10);
-                    let t = parseInt(this._readFileString(this._hwmonCache.drmVramTotalPath) || "0", 10);
-                    this.metrics.gpu.vramUsedMb = Math.round(u / (1024 * 1024));
-                    this.metrics.gpu.vramTotalMb = Math.round(t / (1024 * 1024));
+            this._readFileAsync(this._hwmonCache.drmGpuBusyPath, (busyRaw) => {
+                if (busyRaw !== null) {
+                    this.metrics.gpu.available = true;
+                    this.metrics.gpu.usage = Math.max(0, Math.min(100, parseInt(busyRaw, 10) || 0));
+                    if (this.canvas) this.canvas.queue_repaint();
                 }
-                if (this._hwmonCache.gpuTempPaths.length > 0) {
-                    let tr = this._readFileString(this._hwmonCache.gpuTempPaths[0]);
-                    if (tr) this.metrics.gpu.temp = Math.round(parseInt(tr, 10) / 1000);
-                }
-                return;
+            });
+            if (this._hwmonCache.drmVramUsedPath && this._hwmonCache.drmVramTotalPath) {
+                this._readFileAsync(this._hwmonCache.drmVramUsedPath, (uRaw) => {
+                    if (uRaw !== null) {
+                        this.metrics.gpu.vramUsedMb = Math.round((parseInt(uRaw, 10) || 0) / (1024 * 1024));
+                    }
+                });
+                this._readFileAsync(this._hwmonCache.drmVramTotalPath, (tRaw) => {
+                    if (tRaw !== null) {
+                        this.metrics.gpu.vramTotalMb = Math.round((parseInt(tRaw, 10) || 0) / (1024 * 1024));
+                    }
+                });
             }
+            if (this._hwmonCache.gpuTempPaths.length > 0) {
+                this._readFileAsync(this._hwmonCache.gpuTempPaths[0], (tr) => {
+                    if (tr !== null) {
+                        this.metrics.gpu.temp = Math.round((parseInt(tr, 10) || 0) / 1000);
+                    }
+                });
+            }
+            return;
         }
 
         // 2. Try NVIDIA async via Gio.Subprocess
@@ -510,7 +638,7 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
                                 this.metrics.gpu.vramTotalMb = parseInt(parts[3], 10) || 0;
                                 let temp = parseInt(parts[4], 10);
                                 this.metrics.gpu.temp = isNaN(temp) ? null : temp;
-                                this.canvas.queue_repaint();
+                                if (this.canvas) this.canvas.queue_repaint();
                             }
                         }
                     } catch (e) {}
@@ -523,62 +651,72 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
 
     _updateDisk() {
         let mountPath = (this.diskMountPath || "/").trim() || "/";
-        try {
-            let file = Gio.File.new_for_path(mountPath);
-            let info = file.query_filesystem_info("filesystem::size,filesystem::free,filesystem::used", null);
-            let size = info.get_attribute_uint64("filesystem::size");
-            let free = info.get_attribute_uint64("filesystem::free");
-            let used = info.has_attribute("filesystem::used")
-                ? info.get_attribute_uint64("filesystem::used")
-                : Math.max(0, size - free);
+        let file = Gio.File.new_for_path(mountPath);
+        file.query_filesystem_info_async(
+            "filesystem::size,filesystem::free,filesystem::used",
+            GLib.PRIORITY_DEFAULT,
+            null,
+            (f, res) => {
+                try {
+                    let info = f.query_filesystem_info_finish(res);
+                    let size = info.get_attribute_uint64("filesystem::size");
+                    let free = info.get_attribute_uint64("filesystem::free");
+                    let used = info.has_attribute("filesystem::used")
+                        ? info.get_attribute_uint64("filesystem::used")
+                        : Math.max(0, size - free);
 
-            if (size > 0) {
-                let gb = 1024 * 1024 * 1024;
-                this.metrics.disk.totalGb = size / gb;
-                this.metrics.disk.freeGb = free / gb;
-                this.metrics.disk.usedGb = used / gb;
-                this.metrics.disk.usage = Math.min(100, Math.max(0, Math.round((used / size) * 100)));
-                this.metrics.disk.mount = mountPath;
+                    if (size > 0) {
+                        let gb = 1024 * 1024 * 1024;
+                        this.metrics.disk.totalGb = size / gb;
+                        this.metrics.disk.freeGb = free / gb;
+                        this.metrics.disk.usedGb = used / gb;
+                        this.metrics.disk.usage = Math.min(100, Math.max(0, Math.round((used / size) * 100)));
+                        this.metrics.disk.mount = mountPath;
+                        if (this.canvas) this.canvas.queue_repaint();
+                    }
+                } catch (e) {}
             }
-        } catch (e) {}
+        );
     }
 
     _updateNetwork() {
-        let devContent = this._readFileString("/proc/net/dev");
-        if (!devContent) return;
+        this._readFileAsync("/proc/net/dev", (devContent) => {
+            if (!devContent) return;
 
-        let lines = devContent.split("\n").slice(2);
-        let totalRx = 0;
-        let totalTx = 0;
-        let activeIface = "Offline";
+            let lines = devContent.split("\n").slice(2);
+            let totalRx = 0;
+            let totalTx = 0;
+            let activeIface = "Offline";
 
-        for (let line of lines) {
-            let parts = line.trim().split(/[:\s]+/);
-            if (parts.length < 10) continue;
-            let iface = parts[0];
-            if (iface === "lo" || iface.startsWith("docker") || iface.startsWith("veth") || iface.startsWith("br-") || iface.startsWith("virbr")) {
-                continue;
+            for (let line of lines) {
+                let parts = line.trim().split(/[:\s]+/);
+                if (parts.length < 10) continue;
+                let iface = parts[0];
+                if (iface === "lo" || iface.startsWith("docker") || iface.startsWith("veth") || iface.startsWith("br-") || iface.startsWith("virbr")) {
+                    continue;
+                }
+                let rx = parseFloat(parts[1]) || 0;
+                let tx = parseFloat(parts[9]) || 0;
+                if (rx > 0 || tx > 0) {
+                    totalRx += rx;
+                    totalTx += tx;
+                    if (activeIface === "Offline") activeIface = iface;
+                }
             }
-            let rx = parseFloat(parts[1]) || 0;
-            let tx = parseFloat(parts[9]) || 0;
-            if (rx > 0 || tx > 0) {
-                totalRx += rx;
-                totalTx += tx;
-                if (activeIface === "Offline") activeIface = iface;
-            }
-        }
 
-        let now = GLib.get_monotonic_time() / 1000000.0; // seconds
-        if (this._prevNetTime > 0 && now > this._prevNetTime) {
-            let dt = now - this._prevNetTime;
-            this.metrics.net.rxSpeed = Math.max(0, (totalRx - this._prevNetRx) / dt);
-            this.metrics.net.txSpeed = Math.max(0, (totalTx - this._prevNetTx) / dt);
-        }
-        this._prevNetRx = totalRx;
-        this._prevNetTx = totalTx;
-        this._prevNetTime = now;
-        this.metrics.net.iface = activeIface;
-        this.metrics.net.connected = activeIface !== "Offline";
+            let now = GLib.get_monotonic_time() / 1000000.0;
+            if (this._prevNetTime > 0 && now > this._prevNetTime) {
+                let dt = now - this._prevNetTime;
+                this.metrics.net.rxSpeed = Math.max(0, (totalRx - this._prevNetRx) / dt);
+                this.metrics.net.txSpeed = Math.max(0, (totalTx - this._prevNetTx) / dt);
+            }
+            this._prevNetRx = totalRx;
+            this._prevNetTx = totalTx;
+            this._prevNetTime = now;
+            this.metrics.net.iface = activeIface;
+            this.metrics.net.connected = activeIface !== "Offline";
+            if (this.canvas) this.canvas.queue_repaint();
+        });
     }
 
     _updateBatteries() {
@@ -590,11 +728,9 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
             try {
                 let devices = this._upowerClient.get_devices();
                 for (let d of devices) {
-                    // kind 1 = line-power, kind 2 = battery, kind 3 = ups, kind 5 = mouse, kind 6 = keyboard, kind 8 = phone, etc.
                     if (d.kind === 1) continue;
                     let nativePath = d.native_path || "";
                     let pct = Math.round(d.percentage || 0);
-                    // State: 1 = charging, 2 = discharging, 4 = fully-charged, 5 = pending-charge
                     let isCharging = (d.state === 1 || d.state === 4 || d.state === 5);
 
                     let macMatch = nativePath.match(/([0-9A-Fa-f]{2}[:_]){5}[0-9A-Fa-f]{2}/);
@@ -615,34 +751,6 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
                         type: category.type
                     });
                 }
-            } catch (e) {}
-        }
-
-        // Fallback if UPowerGlib isn't available: check /sys/class/power_supply/BAT*
-        if (list.length === 0) {
-            try {
-                let psDir = Gio.File.new_for_path("/sys/class/power_supply");
-                let en = psDir.enumerate_children("standard::name", Gio.FileQueryInfoFlags.NONE, null);
-                let inf;
-                while ((inf = en.next_file(null)) !== null) {
-                    let name = inf.get_name();
-                    if (name.startsWith("BAT") || name.includes("hid")) {
-                        let base = "/sys/class/power_supply/" + name;
-                        let cap = parseInt(this._readFileString(base + "/capacity") || "0", 10);
-                        let status = (this._readFileString(base + "/status") || "").toLowerCase();
-                        let model = this._readFileString(base + "/model_name") || "Notebook";
-                        list.push({
-                            id: name,
-                            name: this._shortenDeviceName(model),
-                            fullName: model,
-                            percentage: Math.max(0, Math.min(100, cap)),
-                            charging: status.includes("charging") || status.includes("full"),
-                            connected: true,
-                            type: name.startsWith("BAT") ? "laptop" : "bluetooth"
-                        });
-                    }
-                }
-                en.close(null);
             } catch (e) {}
         }
 
@@ -714,6 +822,9 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
                             });
                         }
                         this._cachedBtDevices = btList;
+                        this._updateBatteries();
+                        this._updateCanvasSize();
+                        if (this.canvas) this.canvas.queue_repaint();
                     } catch (e) {}
                 }
             );
@@ -772,7 +883,6 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
     _shortenDeviceName(name) {
         if (!name) return "Device";
         let clean = name.trim();
-        // If it looks like a laptop battery serial (e.g., A32-K55), rename to Notebook
         if (/^[A-Z0-9]{2,5}-[A-Z0-9]{2,5}$/i.test(clean)) {
             return "Notebook";
         }
@@ -887,7 +997,7 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
         }
 
         if (this.showDisk || this.showNetwork) {
-            height += Math.round(10 * s); // divider spacing
+            height += Math.round(10 * s);
             if (this.showDisk && this.showNetwork) {
                 height += Math.round(54 * s);
             } else {
@@ -898,7 +1008,7 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
         if (this.showBatteries) {
             let batCount = Math.max(1, this.metrics.batteries.length);
             let batRows = Math.ceil(batCount / cols);
-            height += Math.round(28 * s); // section title
+            height += Math.round(28 * s);
             height += batRows * cellH + (batRows - 1) * rowGap;
         }
 
@@ -966,35 +1076,34 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
 
     _getMetricColor(type, pct, tempC) {
         if (this.accentStyle === "blue") {
-            return [0.039, 0.518, 1.0]; // #0A84FF
+            return [0.039, 0.518, 1.0];
         }
         if (this.accentStyle === "green") {
-            return [0.188, 0.820, 0.345]; // #30D158
+            return [0.188, 0.820, 0.345];
         }
 
-        // Thermal warning override for CPU/GPU
         if ((type === "cpu" || type === "gpu") && tempC !== null) {
-            if (tempC >= 85) return [1.0, 0.271, 0.227]; // iOS Red #FF453A
-            if (tempC >= 75) return [1.0, 0.624, 0.039]; // iOS Orange #FF9F0A
+            if (tempC >= 85) return [1.0, 0.271, 0.227];
+            if (tempC >= 75) return [1.0, 0.624, 0.039];
         }
 
         if (pct >= 90 && (type === "cpu" || type === "ram" || type === "gpu" || type === "disk")) {
-            return [1.0, 0.271, 0.227]; // #FF453A
+            return [1.0, 0.271, 0.227];
         }
 
         switch (type) {
             case "cpu":
-                return [0.039, 0.518, 1.0];   // iOS System Blue #0A84FF
+                return [0.039, 0.518, 1.0];
             case "ram":
-                return [0.749, 0.353, 0.949]; // iOS System Purple #BF5AF2
+                return [0.749, 0.353, 0.949];
             case "gpu":
-                return [1.0, 0.624, 0.039];   // iOS System Orange #FF9F0A
+                return [1.0, 0.624, 0.039];
             case "fan":
-                return [0.392, 0.824, 1.0];   // iOS System Cyan #64D2FF
+                return [0.392, 0.824, 1.0];
             case "disk":
-                return [0.369, 0.361, 0.902]; // iOS System Indigo #5E5CE6
+                return [0.369, 0.361, 0.902];
             case "net":
-                return [0.188, 0.820, 0.345]; // iOS System Green #30D158
+                return [0.188, 0.820, 0.345];
             default:
                 return [0.039, 0.518, 1.0];
         }
@@ -1003,10 +1112,10 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
     _getBatteryColor(pct, charging, connected) {
         if (!connected) return [0.55, 0.55, 0.60];
         if (this.accentStyle === "blue") return [0.039, 0.518, 1.0];
-        if (charging) return [0.188, 0.820, 0.345]; // iOS Green #30D158
-        if (pct <= 15) return [1.0, 0.271, 0.227];  // iOS Red #FF453A
-        if (pct <= 25) return [1.0, 0.839, 0.039];  // iOS Yellow #FFD60A
-        return [0.188, 0.820, 0.345];               // iOS Green #30D158
+        if (charging) return [0.188, 0.820, 0.345];
+        if (pct <= 15) return [1.0, 0.271, 0.227];
+        if (pct <= 25) return [1.0, 0.839, 0.039];
+        return [0.188, 0.820, 0.345];
     }
 
     // =========================================================================
@@ -1036,7 +1145,6 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
         cr.setSource(grad);
         cr.fillPreserve();
 
-        // Subtle glass specular border
         let borderGrad = new Cairo.LinearGradient(0, 0, 0, h);
         borderGrad.addColorStopRGBA(0, palette.outerBorder[0], palette.outerBorder[1], palette.outerBorder[2], palette.outerBorder[3]);
         borderGrad.addColorStopRGBA(1, palette.outerBorder[0], palette.outerBorder[1], palette.outerBorder[2], palette.outerBorder[3] * 0.35);
@@ -1049,7 +1157,6 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
         // 2. Header Row (macOS Sonoma Widget Header style)
         if (this.showHeader) {
             cr.newPath();
-            // Apple-inspired status dot
             cr.arc(dims.pad + 5 * s, cursorY + 8 * s, 3.8 * s, 0, 2 * Math.PI);
             cr.setSourceRGBA(0.188, 0.820, 0.345, 0.95);
             cr.fill();
@@ -1082,7 +1189,6 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
 
         // 4. Compact Cards Row: Storage Disk & Network Throughput
         if (this.showDisk || this.showNetwork) {
-            // Subtle divider line
             if (hwRings.length > 0) {
                 cr.moveTo(dims.pad, cursorY);
                 cr.lineTo(w - dims.pad, cursorY);
@@ -1119,7 +1225,6 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
                 cursorY += Math.round(8 * s);
             }
 
-            // Section Header
             this._drawText(cr, "BATERIAS & BLUETOOTH", dims.pad, cursorY, {
                 size: Math.round(8.5 * s),
                 weight: Pango.Weight.BOLD,
@@ -1186,14 +1291,12 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
             let cx = cellX + dims.cellW / 2;
             let cy = cellY + ringRadius + Math.round(4 * s);
 
-            // Background track ring
             cr.newPath();
             cr.arc(cx, cy, ringRadius, 0, 2 * Math.PI);
             cr.setSourceRGBA(palette.trackBg[0], palette.trackBg[1], palette.trackBg[2], palette.trackBg[3]);
             cr.setLineWidth(strokeW);
             cr.stroke();
 
-            // Active progress arc (starts at -90 deg / 12 o'clock)
             let progress = Math.max(0, Math.min(1.0, item.progress || 0));
             if (progress > 0.005) {
                 let startAngle = -Math.PI / 2;
@@ -1207,13 +1310,9 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
                 cr.stroke();
             }
 
-            // Center content:
-            // For Battery rings (like iOS Batteries widget): vector device icon in center + lightning bolt badge on top
-            // For Hardware rings: crisp value % in center + small metric icon badge
             if (isBatteryMode) {
                 this._drawVectorIcon(cr, item.icon, cx, cy, Math.round(16 * s), item.connected ? palette.textPrimary : palette.textMuted);
                 if (item.charging) {
-                    // iOS Charging badge at top of the ring
                     let bx = cx;
                     let by = cy - ringRadius;
                     cr.newPath();
@@ -1231,7 +1330,6 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
                 });
             }
 
-            // Primary Label below ring
             let labelY = cy + ringRadius + Math.round(6 * s);
             this._drawText(cr, item.label, cx, labelY, {
                 size: Math.round(8.8 * s),
@@ -1241,7 +1339,6 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
                 maxWidth: dims.cellW + Math.round(6 * s)
             });
 
-            // Secondary Sub-label (Temperature, GB, RPM, or Battery %)
             let subY = labelY + Math.round(13 * s);
             this._drawText(cr, item.subLabel, cx, subY, {
                 size: Math.round(8.0 * s),
@@ -1287,7 +1384,6 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
             align: "right"
         });
 
-        // Progress bar
         let barY = y + Math.round(23 * s);
         let barH = Math.round(5.5 * s);
         let barW = w - padX * 2;
@@ -1303,7 +1399,6 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
             cr.fill();
         }
 
-        // Free / Total caption
         let freeText = Math.round(this.metrics.disk.freeGb) + " GB livres de " + Math.round(this.metrics.disk.totalGb) + " GB";
         this._drawText(cr, freeText, x + padX, y + Math.round(31 * s), {
             size: Math.round(7.5 * s),
@@ -1386,7 +1481,6 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
 
         switch (type) {
             case "laptop": {
-                // MacBook style laptop icon
                 let bw = r * 1.45;
                 let bh = r * 0.95;
                 this._drawRoundedRect(cr, cx - bw / 2, cy - bh / 2 - r * 0.1, bw, bh, 2);
@@ -1399,7 +1493,6 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
                 break;
             }
             case "headphone": {
-                // AirPods Max / Headphones arch + earcups
                 cr.newPath();
                 cr.arc(cx, cy, r * 0.68, Math.PI, 0);
                 cr.setLineWidth(1.8);
@@ -1411,7 +1504,6 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
                 break;
             }
             case "speaker": {
-                // Speaker box + sound waves
                 let sw = r * 1.1;
                 let sh = r * 1.45;
                 this._drawRoundedRect(cr, cx - sw / 2, cy - sh / 2, sw, sh, 2.5);
@@ -1427,7 +1519,6 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
                 break;
             }
             case "mouse": {
-                // Magic Mouse silhouette
                 let mw = r * 0.95;
                 let mh = r * 1.45;
                 this._drawRoundedRect(cr, cx - mw / 2, cy - mh / 2, mw, mh, mw / 2);
@@ -1456,8 +1547,10 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
                 this._drawRoundedRect(cr, cx - gw / 2, cy - gh / 2, gw, gh, gh * 0.4);
                 cr.setLineWidth(1.5);
                 cr.stroke();
+                cr.newPath();
                 cr.arc(cx - gw * 0.22, cy, 1.3, 0, 2 * Math.PI);
                 cr.fill();
+                cr.newPath();
                 cr.arc(cx + gw * 0.22, cy, 1.3, 0, 2 * Math.PI);
                 cr.fill();
                 break;
@@ -1471,7 +1564,6 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
                 break;
             }
             case "bolt": {
-                // Charging lightning bolt
                 cr.moveTo(cx + r * 0.15, cy - r * 0.85);
                 cr.lineTo(cx - r * 0.45, cy + r * 0.05);
                 cr.lineTo(cx + r * 0.05, cy + r * 0.05);
@@ -1486,6 +1578,7 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
                 this._drawRoundedRect(cr, cx - r * 0.85, cy - r * 0.65, r * 1.7, r * 1.3, 2);
                 cr.setLineWidth(1.4);
                 cr.stroke();
+                cr.newPath();
                 cr.arc(cx + r * 0.45, cy + r * 0.2, 1.3, 0, 2 * Math.PI);
                 cr.fill();
                 break;
@@ -1504,7 +1597,6 @@ class IOSHardwareMonitorDesklet extends Desklet.Desklet {
                 break;
             }
             default: {
-                // Bluetooth rune icon
                 cr.setLineWidth(1.5);
                 cr.moveTo(cx - r * 0.38, cy - r * 0.38);
                 cr.lineTo(cx + r * 0.38, cy + r * 0.38);
