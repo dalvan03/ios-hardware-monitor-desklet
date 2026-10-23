@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#242429"/>
+      <stop offset="100%" stop-color="#141417"/>
+    </linearGradient>
+  </defs>
+  <rect x="6" y="6" width="116" height="116" rx="28" fill="url(#bg)" stroke="#ffffff" stroke-opacity="0.18" stroke-width="2"/>
+  <!-- Top Left Ring (Blue CPU) -->
+  <circle cx="42" cy="42" r="18" fill="none" stroke="#ffffff" stroke-opacity="0.12" stroke-width="6"/>
+  <path d="M 42 24 A 18 18 0 1 1 25.5 49" fill="none" stroke="#0A84FF" stroke-width="6" stroke-linecap="round"/>
+  <!-- Top Right Ring (Purple RAM) -->
+  <circle cx="86" cy="42" r="18" fill="none" stroke="#ffffff" stroke-opacity="0.12" stroke-width="6"/>
+  <path d="M 86 24 A 18 18 0 1 1 86 60" fill="none" stroke="#BF5AF2" stroke-width="6" stroke-linecap="round"/>
+  <!-- Bottom Left Ring (Green Battery) -->
+  <circle cx="42" cy="86" r="18" fill="none" stroke="#ffffff" stroke-opacity="0.12" stroke-width="6"/>
+  <path d="M 42 68 A 18 18 0 1 1 24 86" fill="none" stroke="#30D158" stroke-width="6" stroke-linecap="round"/>
+  <!-- Bottom Right Ring (Orange GPU) -->
+  <circle cx="86" cy="86" r="18" fill="none" stroke="#ffffff" stroke-opacity="0.12" stroke-width="6"/>
+  <path d="M 86 68 A 18 18 0 0 1 104 86" fill="none" stroke="#FF9F0A" stroke-width="6" stroke-linecap="round"/>
+</svg>
