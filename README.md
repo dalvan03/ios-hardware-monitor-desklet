@@ -1,42 +1,52 @@
 # iOS Hardware & Battery Monitor (`ios-hardware-monitor@dalvan`)
 
-Desklet **All-in-One** para Linux Mint / Cinnamon com estética inspirada nos widgets de **Baterias e Monitor de Atividade do iOS / macOS Sonoma** (anéis circulares *squircle*, tipografia limpa e efeito *glassmorphism* translúcido).
+An **All-in-One Hardware & Bluetooth Battery Monitor** desklet for Linux Mint / Cinnamon, featuring circular gauges, squircle cards, and glassmorphic design inspired by **iOS and macOS Sonoma** widgets.
 
-![Preview do Desklet](ios-hardware-monitor@dalvan/screenshot.png)
+![Preview](ios-hardware-monitor@dalvan/screenshot.png)
 
-## Recursos Principais
+## Key Features
 
-- **Anéis de Hardware em Tempo Real (Sem Dependências Externas)**:
-  - **CPU**: Uso percentual (`/proc/stat`) e temperatura do pacote via `hwmon` (`k10temp`, `coretemp`, `zenpower`, `acpitz`).
-  - **RAM & Swap**: Uso percentual e GB consumidos (`/proc/meminfo`).
-  - **GPU (NVIDIA / AMD / Intel)**: Uso percentual, temperatura e VRAM (via DRM `sysfs` nativo para AMD/Intel ou `nvidia-smi` assíncrono não-bloqueante para GPUs NVIDIA).
-  - **Cooler / Fan RPM**: Leitura automática dos sensores de rotação (`fan*_input` no `/sys/class/hwmon`) com indicador em RPM / `k`.
-- **Cards Compactos de Armazenamento & Rede**:
-  - **Disco**: Barra de progresso horizontal com percentual e GB livres (`Gio.File.query_filesystem_info`).
-  - **Rede**: Velocidade de Download (`↓`) e Upload (`↑`) em tempo real na interface ativa (`/proc/net/dev`).
-- **Monitor de Baterias + Dispositivos Bluetooth (Estilo iOS Batteries)**:
-  - Integração nativa via **UPower (`UPowerGlib`)** e **BlueZ D-Bus (`org.freedesktop.DBus.ObjectManager` / `org.bluez.Battery1`)**.
-  - Ícones vetoriais desenhados em Cairo para Notebook, Fones Bluetooth / AirPods, Caixas de Som, Mouse, Teclado, Controles e Celulares, além de badge de carregamento com raio.
-  - Cores semafóricas inteligentes do iOS (Verde `#30D158`, Amarelo `#FFD60A` ≤ 25%, Vermelho `#FF453A` ≤ 15%).
-- **Personalização Completa (Settings nativo do Cinnamon)**:
-  - Temas **Escuro Translúcido (macOS Dark Glass)**, **Claro Translúcido (iOS Light Frosted)** e **Automático**.
-  - Ajuste de opacidade, arredondamento das bordas, escala de tamanho (`0.75x` a `1.6x`), colunas por linha e ativação individual de cada módulo.
+- **Real-Time Hardware Circular Gauges (Zero External Dependencies)**:
+  - **CPU**: Usage percentage (`/proc/stat`) and package temperature via `hwmon` (`k10temp`, `coretemp`, `zenpower`, `acpitz`).
+  - **RAM & Swap**: Usage percentage and consumed GB (`/proc/meminfo`).
+  - **GPU (NVIDIA / AMD / Intel)**: Usage percentage, temperature, and VRAM via native Linux DRM `sysfs` (`gpu_busy_percent`) for AMD/Intel or non-blocking async `nvidia-smi` for NVIDIA GPUs.
+  - **Cooler / Fan RPM**: Automatic detection of fan speed sensors (`fan*_input` in `/sys/class/hwmon`) displayed in RPM / `k`.
+- **Compact Storage & Network Cards**:
+  - **Disk**: Horizontal progress bar with used percentage and free/total GB (`Gio.File.query_filesystem_info`).
+  - **Network**: Live Download (`↓`) and Upload (`↑`) throughput on the active network interface (`/proc/net/dev`).
+- **Batteries & Bluetooth Monitor (iOS Batteries Style)**:
+  - Native integration via **UPower (`UPowerGlib`)** and **BlueZ D-Bus (`org.freedesktop.DBus.ObjectManager` / `org.bluez.Battery1`)**.
+  - Custom Cairo vector icons for Laptop, Bluetooth Headphones/AirPods, Speakers, Mice, Keyboards, Gamepads, and Phones, plus a charging lightning bolt badge.
+  - Smart iOS traffic-light color coding (Green `#30D158`, Yellow `#FFD60A` ≤ 25%, Red `#FF453A` ≤ 15%).
+- **Full Customization (Native Cinnamon Settings)**:
+  - **Dark Glass (macOS Dark)**, **Light Frosted (iOS Light)**, and **Auto (System Theme)** modes.
+  - Configurable background opacity, corner radius, widget scale (`0.75x` to `1.6x`), grid columns per row, header title mode (Device Model, Distro, Hostname, User, or Custom Text), and individual module toggles.
 
-## Instalação Rápida
+## Quick Installation
 
-### Modo Desenvolvimento (Symlink automático)
+### Standard Installation
+```bash
+git clone https://github.com/dalvan03/ios-hardware-monitor-desklet.git
+cd ios-hardware-monitor-desklet
+./install.sh
+```
+
+### Development Mode (Symlink to `~/.local/share/cinnamon/desklets`)
 ```bash
 ./install.sh --symlink
 ```
 
-### Instalação Padrão (Cópia para `~/.local/share/cinnamon/desklets`)
-```bash
-./install.sh
-```
+After installing:
+1. Right-click on your desktop and select **Add Desklets**.
+2. Select **iOS Hardware & Battery Monitor** and click the **`+`** button.
 
-## Estrutura do Projeto
+## Project Structure
 
-- [`ios-hardware-monitor@dalvan/desklet.js`](ios-hardware-monitor@dalvan/desklet.js): Lógica de telemetria e renderização vetorial em Cairo/Pango.
-- [`ios-hardware-monitor@dalvan/settings-schema.json`](ios-hardware-monitor@dalvan/settings-schema.json): Esquema de configurações para o painel do Cinnamon.
-- [`ios-hardware-monitor@dalvan/metadata.json`](ios-hardware-monitor@dalvan/metadata.json): Manifesto compatível com o Cinnamon Spices.
-- [`ios-hardware-monitor@dalvan/icon.svg`](ios-hardware-monitor@dalvan/icon.svg): Ícone vetorial do Desklet.
+- [`ios-hardware-monitor@dalvan/desklet.js`](ios-hardware-monitor@dalvan/desklet.js): Telemetry engine and Cairo/Pango vector rendering.
+- [`ios-hardware-monitor@dalvan/settings-schema.json`](ios-hardware-monitor@dalvan/settings-schema.json): Cinnamon Desklet configuration schema.
+- [`ios-hardware-monitor@dalvan/metadata.json`](ios-hardware-monitor@dalvan/metadata.json): Desklet manifest.
+- [`ios-hardware-monitor@dalvan/icon.png`](ios-hardware-monitor@dalvan/icon.png): Desklet icon.
+
+## License
+
+Released under the **GPL-3.0** license.
